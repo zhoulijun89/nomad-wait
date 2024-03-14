@@ -1,5 +1,5 @@
 # Nomad Wait
-Monitor for Hashicorp Nomad batch jobs
+Wait for Hashicorp Nomad allocations
 
 ## Usage
 
