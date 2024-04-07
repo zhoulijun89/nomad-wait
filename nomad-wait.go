@@ -215,7 +215,7 @@ Default = 60
 	}
 
 	fmt.Print("Allocation timed out\n")
-	return 0
+	return 1
 }
 
 func main() {
