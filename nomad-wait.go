@@ -114,7 +114,7 @@ func parseAllocationName(name string) (string, string, int, error) {
 	return match[1], match[2], index, nil
 }
 
-// monitoredAllocations 获取匹配作业和任务组的分配列表（用于初始加载）
+// monitoredAllocations 获取匹配作业和任务组的分配列表（用于初始加载或轮询）
 // 参数:
 //   - client: Nomad API 客户端
 //   - jobName: 作业名称
@@ -125,10 +125,10 @@ func monitoredAllocations(client *api.Client, jobName, group string) ([]*Allocat
 	var result []*Allocation
 	q := api.QueryOptions{}
 
-	// 支持分页：使用 NextToken 获取所有分配
+	// 获取分配列表（支持分页）
 	var nextToken string
 	for {
-		allocs, meta, err := client.Allocations().ListStub(nextToken, &q)
+		allocs, meta, err := client.Allocations().List(&q)
 		if err != nil {
 			return nil, fmt.Errorf("无法从 Nomad 服务器获取分配列表: %v", err)
 		}
@@ -159,6 +159,7 @@ func monitoredAllocations(client *api.Client, jobName, group string) ([]*Allocat
 			break
 		}
 		nextToken = meta.NextToken
+		q.NextToken = nextToken
 	}
 
 	return result, nil
@@ -197,7 +198,7 @@ func checkStatus(cache AllocCache, targetGroup, acceptableStatus string) (bool, 
 		}
 
 		status := allocationStatus(a)
-		log.Printf("[DEBUG] 检查分配 %s (TaskGroup: %s): 状态 %s", a.ID, a.TaskGroup, status)
+		log.Printf("[DEBUG] 检查分配 %s (TaskGroup: %s, Index: %d): 状态 %s", a.ID, a.TaskGroup, a.Index, status)
 
 		if status == STATUS_FAILED {
 			failed = true
@@ -227,38 +228,46 @@ func checkStatus(cache AllocCache, targetGroup, acceptableStatus string) (bool, 
 // 返回:
 //   - 是否更新了缓存
 func updateCacheFromEvent(cache AllocCache, ev *api.Event, jobName, targetGroup string) bool {
-	if ev.Topic != api.TopicAllocation {
+	if ev.Type != api.TopicAllocation {
 		return false
 	}
 
 	// 解码事件 payload 为 Allocation
-	payload, err := ev.Allocation()
+	alloc, err := ev.Allocation()
 	if err != nil {
 		log.Printf("[ERROR] 解码事件 payload 失败: %v", err)
 		return false
 	}
 
-	if payload == nil || payload.JobID != jobName {
+	if alloc == nil || alloc.JobID != jobName {
 		return false
 	}
 
-	if targetGroup != "" && payload.TaskGroup != targetGroup {
+	if targetGroup != "" && alloc.TaskGroup != targetGroup {
 		return false
 	}
 
 	// 更新或添加缓存
-	newAlloc := &Allocation{AllocationListStub: *payload.AllocStub()}
-	_, _, index, err := parseAllocationName(payload.Name)
+	newAlloc := &Allocation{AllocationListStub: api.AllocationListStub{
+		ID:              alloc.ID,
+		JobID:           alloc.JobID,
+		TaskGroup:       alloc.TaskGroup,
+		ClientStatus:    alloc.ClientStatus,
+		DeploymentStatus: alloc.DeploymentStatus,
+		CreateTime:      alloc.CreateTime,
+	}}
+	_, _, index, err := parseAllocationName(alloc.Name)
 	if err == nil {
 		newAlloc.Index = index
 	}
-	cache[payload.ID] = newAlloc
+	cache[alloc.ID] = newAlloc
 
-	log.Printf("[DEBUG] 更新分配缓存: ID=%s, TaskGroup=%s, 新状态=%s", payload.ID, payload.TaskGroup, payload.ClientStatus)
+	log.Printf("[DEBUG] 更新分配缓存: ID=%s, TaskGroup=%s, 新状态=%s", alloc.ID, alloc.TaskGroup, alloc.ClientStatus)
 	return true
 }
 
 // setupLogger 设置日志级别
+// 支持环境变量 NOMAD_LOG_LEVEL（debug/info/error，默认 info）
 func setupLogger() {
 	level := stringFromEnv("NOMAD_LOG_LEVEL", "info")
 	switch strings.ToLower(level) {
@@ -272,7 +281,7 @@ func setupLogger() {
 	log.Printf("[INFO] 日志级别设置为 %s", level)
 }
 
-// Run 主逻辑函数，执行等待作业或任务组健康状态的逻辑（使用事件流）
+// Run 主逻辑函数，执行等待作业或任务组健康状态的逻辑（优先事件流，回退轮询）
 // 返回:
 //   - 退出码（0 表示成功，1 表示失败）
 func Run() int {
@@ -345,10 +354,23 @@ Nomad ACL 认证令牌。
 		groupMsg = fmt.Sprintf("任务组 '%s'", group)
 	}
 	if timeout == 0 {
-		log.Printf("[INFO] 无限期等待 Nomad 作业 '%s' (%s) - 使用事件流监控", jobName, groupMsg)
+		log.Printf("[INFO] 无限期等待 Nomad 作业 '%s' (%s) - 尝试事件流监控", jobName, groupMsg)
 	} else {
-		log.Printf("[INFO] 等待 Nomad 作业 '%s' (%s) %d 秒 - 使用事件流监控", jobName, groupMsg, timeout)
+		log.Printf("[INFO] 等待 Nomad 作业 '%s' (%s) %d 秒 - 尝试事件流监控", jobName, groupMsg, timeout)
 	}
+
+	// 创建上下文以支持取消
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 处理信号（如 Ctrl+C）
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Printf("[INFO] 接收到中断信号，退出")
+		cancel()
+	}()
 
 	// 步骤 1: 初始状态检查
 	log.Printf("[INFO] 执行初始分配状态检查...")
@@ -392,33 +414,24 @@ Nomad ACL 认证令牌。
 	}
 	log.Printf("[INFO] [%s] 初始检查: 分配进行中", indicator)
 
-	// 步骤 2: 订阅事件流
-	topics := map[api.Topic][]string{
-		api.TopicAllocation: {jobName}, // 订阅该作业的分配事件
+	// 步骤 2: 尝试订阅事件流
+	var eventChan <-chan *api.Event
+	const maxRetries = 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		events := client.Event()
+		var err error
+		eventChan, err = events.Stream(ctx, map[api.Topic][]string{api.TopicAllocation: {jobName}}, 0, &api.QueryOptions{})
+		if err == nil {
+			log.Printf("[INFO] 事件流订阅成功，等待相关事件...")
+			break
+		}
+		log.Printf("[WARN] 事件流订阅失败 (尝试 %d/%d): %v", attempt, maxRetries, err)
+		if attempt == maxRetries {
+			log.Printf("[ERROR] 事件流订阅失败，切换到轮询模式")
+			eventChan = nil
+		}
+		time.Sleep(time.Second * time.Duration(attempt))
 	}
-	q := &api.QueryOptions{}
-	es := client.Events()
-	eventChan, err := es.Stream(context.Background(), topics, 0, q) // 从最新索引开始
-	if err != nil {
-		log.Printf("[ERROR] 订阅事件流失败: %v。考虑升级 Nomad 到 1.0+ 或检查 ACL 权限。", err)
-		return 1
-	}
-	defer es.Close()
-
-	log.Printf("[INFO] 事件流订阅成功，等待相关事件...")
-
-	// 创建上下文以支持取消和超时
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// 处理信号（如 Ctrl+C）
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		log.Printf("[INFO] 接收到中断信号，关闭事件流")
-		cancel()
-	}()
 
 	// 超时通道
 	var timeoutChan <-chan time.Time
@@ -426,9 +439,9 @@ Nomad ACL 认证令牌。
 		timeoutChan = time.After(time.Duration(timeout) * time.Second)
 	}
 
-	// 事件处理循环
+	// 主循环：优先事件流，失败则轮询
 	var elapsed int
-	ticker := time.NewTicker(10 * time.Second) // 每 10 秒打印进度
+	ticker := time.NewTicker(2 * time.Second) // 轮询间隔 2 秒
 	defer ticker.Stop()
 
 	for {
@@ -442,28 +455,42 @@ Nomad ACL 认证令牌。
 				return 1
 			}
 		case ev, ok := <-eventChan:
-			if !ok {
-				log.Printf("[ERROR] 事件通道关闭")
-				return 1
+			if !ok && eventChan != nil {
+				log.Printf("[ERROR] 事件通道关闭，切换到轮询模式")
+				eventChan = nil
 			}
+			if ok && ev != nil {
+				if updated := updateCacheFromEvent(cache, ev, jobName, group); updated {
+					log.Printf("[DEBUG] 接收事件: Topic=%s, AllocID=%s, Type=%s", ev.Type, ev.AllocID, ev.Type)
 
-			// 处理事件
-			if updated := updateCacheFromEvent(cache, ev, jobName, group); updated {
-				log.Printf("[DEBUG] 接收事件: Topic=%s, AllocID=%s, Type=%s", ev.Topic, ev.AllocID, ev.Type)
-
-				successful, failed, indicator = checkStatus(cache, group, acceptableStatus)
-				if failed {
-					log.Printf("[ERROR] [%s] 事件触发: 分配失败 (AllocID: %s)", indicator, ev.AllocID)
-					return 1
+					successful, failed, indicator = checkStatus(cache, group, acceptableStatus)
+					if failed {
+						log.Printf("[ERROR] [%s] 事件触发: 分配失败 (AllocID: %s)", indicator, ev.AllocID)
+						return 1
+					}
+					if successful {
+						log.Printf("[INFO] [%s] 事件触发: 分配成功 (AllocID: %s)", indicator, ev.AllocID)
+						return 0
+					}
+					log.Printf("[INFO] [%s] 事件更新: 分配进行中 (AllocID: %s)", indicator, ev.AllocID)
 				}
-				if successful {
-					log.Printf("[INFO] [%s] 事件触发: 分配成功 (AllocID: %s)", indicator, ev.AllocID)
-					return 0
-				}
-				log.Printf("[INFO] [%s] 事件更新: 分配进行中 (AllocID: %s)", indicator, ev.AllocID)
 			}
 		case <-ticker.C:
-			elapsed += 10
+			elapsed += 2
+			// 如果事件流不可用，使用轮询
+			if eventChan == nil {
+				allocs, err := monitoredAllocations(client, jobName, group)
+				if err != nil {
+					log.Printf("[ERROR] 轮询分配列表失败: %v", err)
+					return 1
+				}
+				cache = make(AllocCache)
+				for _, a := range allocs {
+					cache[a.ID] = a
+				}
+				log.Printf("[DEBUG] 轮询更新缓存: %d 个分配", len(cache))
+			}
+
 			successful, failed, indicator := checkStatus(cache, group, acceptableStatus)
 			if failed {
 				log.Printf("[ERROR] [%s] 进度检查: 分配失败", indicator)
@@ -473,7 +500,9 @@ Nomad ACL 认证令牌。
 				log.Printf("[INFO] [%s] 进度检查: 分配成功", indicator)
 				return 0
 			}
-			log.Printf("[INFO] [%s] 等待中，耗时 %ds (缓存大小: %d)", indicator, elapsed, len(cache))
+			if elapsed%10 == 0 {
+				log.Printf("[INFO] [%s] 等待中，耗时 %ds (缓存大小: %d)", indicator, elapsed, len(cache))
+			}
 		}
 	}
 }
