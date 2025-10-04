@@ -22,6 +22,10 @@ jobs:
       with:
         go-version: '1.25'
         cache: true
+        
+    - name: Setup Go MOD
+      run: ｜
+        go mod tidy   
 
     - name: Build from single file
       run: |
