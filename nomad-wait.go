@@ -410,7 +410,7 @@ Nomad ACL 认证令牌。
 			}
 			if ok && events != nil {
 				for _, ev := range events.Events { // 遍历 Events 切片
-					if updated := updateCacheFromEvent(cache, ev, jobName, group); updated { // 传递 *api.Event
+					if updated := updateCacheFromEvent(cache, &ev, jobName, group); updated { // 传递 *api.Event
 						alloc, _ := ev.Allocation()
 						log.Printf("[DEBUG] 接收事件: Topic=%s, AllocID=%s, Type=%s", ev.Type, alloc.ID, ev.Type)
 
