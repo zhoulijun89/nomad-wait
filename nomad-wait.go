@@ -228,7 +228,7 @@ func checkStatus(cache AllocCache, targetGroup, acceptableStatus string) (bool, 
 // 返回:
 //   - 是否更新了缓存
 func updateCacheFromEvent(cache AllocCache, ev *api.Event, jobName, targetGroup string) bool {
-	if ev.Type != api.TopicAllocation {
+	if ev.Type != "Allocation" { // 修正：使用字符串比较
 		return false
 	}
 
@@ -418,9 +418,9 @@ Nomad ACL 认证令牌。
 	var eventChan <-chan *api.Event
 	const maxRetries = 3
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		events := client.Event()
+		events := client.EventStream() // 修正：使用 EventStream
 		var err error
-		eventChan, err = events.Stream(ctx, map[api.Topic][]string{api.TopicAllocation: {jobName}}, 0, &api.QueryOptions{})
+		eventChan, err = events.Stream(ctx, map[api.Topic][]string{api.Topic("Allocation"): {jobName}}, 0, &api.QueryOptions{})
 		if err == nil {
 			log.Printf("[INFO] 事件流订阅成功，等待相关事件...")
 			break
@@ -461,18 +461,19 @@ Nomad ACL 认证令牌。
 			}
 			if ok && ev != nil {
 				if updated := updateCacheFromEvent(cache, ev, jobName, group); updated {
-					log.Printf("[DEBUG] 接收事件: Topic=%s, AllocID=%s, Type=%s", ev.Type, ev.AllocID, ev.Type)
+					alloc, _ := ev.Allocation() // 修正：从 ev.Allocation 获取 ID
+					log.Printf("[DEBUG] 接收事件: Topic=%s, AllocID=%s, Type=%s", ev.Type, alloc.ID, ev.Type)
 
 					successful, failed, indicator = checkStatus(cache, group, acceptableStatus)
 					if failed {
-						log.Printf("[ERROR] [%s] 事件触发: 分配失败 (AllocID: %s)", indicator, ev.AllocID)
+						log.Printf("[ERROR] [%s] 事件触发: 分配失败 (AllocID: %s)", indicator, alloc.ID)
 						return 1
 					}
 					if successful {
-						log.Printf("[INFO] [%s] 事件触发: 分配成功 (AllocID: %s)", indicator, ev.AllocID)
+						log.Printf("[INFO] [%s] 事件触发: 分配成功 (AllocID: %s)", indicator, alloc.ID)
 						return 0
 					}
-					log.Printf("[INFO] [%s] 事件更新: 分配进行中 (AllocID: %s)", indicator, ev.AllocID)
+					log.Printf("[INFO] [%s] 事件更新: 分配进行中 (AllocID: %s)", indicator, alloc.ID)
 				}
 			}
 		case <-ticker.C:
