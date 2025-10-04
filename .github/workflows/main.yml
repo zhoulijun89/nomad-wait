@@ -1,44 +1,49 @@
-name: Build with Multiple Go Versions
+name: Build nomad-wait for Linux x86_64
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
-  build-matrix:
-    name: Build (Go ${{ matrix.go-version }})
+  build:
+    name: Build from nomad-wait.go
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        go-version: [ '1.22' ]
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Setup Go ${{ matrix.go-version }}
+    - name: List files
+      run: ls -la
+
+    - name: Setup Go
       uses: actions/setup-go@v4
       with:
-        go-version: ${{ matrix.go-version }}
+        go-version: '1.22'
         cache: true
 
-    - name: Build static binary
+    - name: Build from single file
       run: |
         CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-          -o nomad-wait-go${{ matrix.go-version }} \
-          -ldflags="-s -w -X main.Version=go${{ matrix.go-version }}-${{ github.sha }}" \
-          nomad-wait
+          -o nomad-wait \
+          -ldflags="-s -w" \
+          nomad-wait.go
 
     - name: Verify binary
       run: |
-        echo "=== Go ${{ matrix.go-version }} 构建结果 ==="
-        file nomad-wait-go${{ matrix.go-version }}
-        ldd nomad-wait-go${{ matrix.go-version }} 2>/dev/null || echo "✅ 静态链接"
+        echo "=== 文件信息 ==="
+        file nomad-wait
+        echo "=== 依赖检查 ==="
+        ldd nomad-wait 2>/dev/null || echo "✅ 静态二进制文件"
+        echo "=== 文件大小 ==="
+        ls -lh nomad-wait
+        echo "=== 测试执行 ==="
+        ./nomad-wait --version || ./nomad-wait --help || echo "✅ 二进制文件可执行"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: nomad-wait-go${{ matrix.go-version }}
-        path: nomad-wait-go${{ matrix.go-version }}
+        name: nomad-wait-linux-amd64
+        path: nomad-wait
+        retention-days: 30
