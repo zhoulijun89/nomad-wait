@@ -36,12 +36,6 @@ type Allocation struct {
 type AllocCache map[string]*Allocation
 
 // findAllocation 在分配列表中查找特定任务组和索引的分配
-// 参数:
-//   - allocs: 分配列表
-//   - taskGroup: 任务组名称
-//   - index: 分配索引
-// 返回:
-//   - 匹配的分配指针，或 nil 如果未找到
 func findAllocation(allocs []*Allocation, taskGroup string, index int) *Allocation {
 	for _, alloc := range allocs {
 		if alloc.TaskGroup == taskGroup && alloc.Index == index {
@@ -52,11 +46,6 @@ func findAllocation(allocs []*Allocation, taskGroup string, index int) *Allocati
 }
 
 // stringFromEnv 从环境变量读取字符串值，若未设置或为空则返回默认值
-// 参数:
-//   - key: 环境变量名
-//   - def: 默认值
-// 返回:
-//   - 环境变量值或默认值
 func stringFromEnv(key string, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return strings.TrimSpace(v)
@@ -65,11 +54,6 @@ func stringFromEnv(key string, def string) string {
 }
 
 // intFromEnv 从环境变量读取整数值，若解析失败则返回错误
-// 参数:
-//   - key: 环境变量名
-//   - def: 默认值
-// 返回:
-//   - 整数值和可能的错误
 func intFromEnv(key string, def int) (int, error) {
 	if v := os.Getenv(key); v != "" {
 		i, err := strconv.Atoi(strings.TrimSpace(v))
@@ -82,10 +66,6 @@ func intFromEnv(key string, def int) (int, error) {
 }
 
 // jobNameFromArgs 解析命令行参数以获取作业名称
-// 参数:
-//   - args: 命令行参数列表
-// 返回:
-//   - 作业名称和可能的错误
 func jobNameFromArgs(args []string) (string, error) {
 	if len(args) == 0 || len(args) > 1 {
 		return "", errors.New("参数数量不正确")
@@ -94,11 +74,6 @@ func jobNameFromArgs(args []string) (string, error) {
 }
 
 // parseAllocationName 解析分配名称，提取作业ID、任务组和索引
-// 分配名称格式: <job>.<taskgroup>[<index>]
-// 参数:
-//   - name: 分配名称
-// 返回:
-//   - 作业ID、任务组名称、索引和可能的错误
 func parseAllocationName(name string) (string, string, int, error) {
 	nameRegexp := regexp.MustCompile(`([\w-]+)\.([\w-]+)\[(\d+)\]`)
 	match := nameRegexp.FindStringSubmatch(name)
@@ -115,12 +90,6 @@ func parseAllocationName(name string) (string, string, int, error) {
 }
 
 // monitoredAllocations 获取匹配作业和任务组的分配列表（用于初始加载或轮询）
-// 参数:
-//   - client: Nomad API 客户端
-//   - jobName: 作业名称
-//   - group: 任务组名称（可选，空字符串表示所有组）
-// 返回:
-//   - 分配列表和可能的错误
 func monitoredAllocations(client *api.Client, jobName, group string) ([]*Allocation, error) {
 	var result []*Allocation
 	q := api.QueryOptions{}
@@ -166,10 +135,6 @@ func monitoredAllocations(client *api.Client, jobName, group string) ([]*Allocat
 }
 
 // allocationStatus 获取分配的状态
-// 参数:
-//   - alloc: 分配对象
-// 返回:
-//   - 状态字符串（healthy, unhealthy, complete, failed 等）
 func allocationStatus(alloc *Allocation) string {
 	human_readable := map[bool]string{true: STATUS_HEALTHY, false: STATUS_UNHEALTHY}
 
@@ -181,12 +146,6 @@ func allocationStatus(alloc *Allocation) string {
 }
 
 // checkStatus 检查缓存中的分配是否达到目标状态
-// 参数:
-//   - cache: 分配缓存
-//   - targetGroup: 目标任务组（空表示所有）
-//   - acceptableStatus: 目标状态
-// 返回:
-//   - successful, failed, indicator 字符串
 func checkStatus(cache AllocCache, targetGroup, acceptableStatus string) (bool, bool, string) {
 	var indicator string
 	successful := true
@@ -220,15 +179,8 @@ func checkStatus(cache AllocCache, targetGroup, acceptableStatus string) (bool, 
 }
 
 // updateCacheFromEvent 从事件更新分配缓存
-// 参数:
-//   - cache: 分配缓存
-//   - ev: Nomad 事件
-//   - jobName: 作业名称
-//   - targetGroup: 目标任务组
-// 返回:
-//   - 是否更新了缓存
 func updateCacheFromEvent(cache AllocCache, ev *api.Event, jobName, targetGroup string) bool {
-	if ev.Type != "Allocation" { // 修正：使用字符串比较
+	if ev.Type != "Allocation" {
 		return false
 	}
 
@@ -267,7 +219,6 @@ func updateCacheFromEvent(cache AllocCache, ev *api.Event, jobName, targetGroup 
 }
 
 // setupLogger 设置日志级别
-// 支持环境变量 NOMAD_LOG_LEVEL（debug/info/error，默认 info）
 func setupLogger() {
 	level := stringFromEnv("NOMAD_LOG_LEVEL", "info")
 	switch strings.ToLower(level) {
@@ -282,8 +233,6 @@ func setupLogger() {
 }
 
 // Run 主逻辑函数，执行等待作业或任务组健康状态的逻辑（优先事件流，回退轮询）
-// 返回:
-//   - 退出码（0 表示成功，1 表示失败）
 func Run() int {
 	setupLogger() // 初始化日志
 
@@ -415,10 +364,10 @@ Nomad ACL 认证令牌。
 	log.Printf("[INFO] [%s] 初始检查: 分配进行中", indicator)
 
 	// 步骤 2: 尝试订阅事件流
-	var eventChan <-chan *api.Event
+	var eventChan <-chan *api.Events // 修正：使用 *api.Events
 	const maxRetries = 3
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		events := client.EventStream() // 修正：使用 EventStream
+		events := client.EventStream()
 		var err error
 		eventChan, err = events.Stream(ctx, map[api.Topic][]string{api.Topic("Allocation"): {jobName}}, 0, &api.QueryOptions{})
 		if err == nil {
@@ -454,26 +403,28 @@ Nomad ACL 认证令牌。
 				log.Printf("[ERROR] 事件等待超时 (%d 秒)", timeout)
 				return 1
 			}
-		case ev, ok := <-eventChan:
+		case events, ok := <-eventChan:
 			if !ok && eventChan != nil {
 				log.Printf("[ERROR] 事件通道关闭，切换到轮询模式")
 				eventChan = nil
 			}
-			if ok && ev != nil {
-				if updated := updateCacheFromEvent(cache, ev, jobName, group); updated {
-					alloc, _ := ev.Allocation() // 修正：从 ev.Allocation 获取 ID
-					log.Printf("[DEBUG] 接收事件: Topic=%s, AllocID=%s, Type=%s", ev.Type, alloc.ID, ev.Type)
+			if ok && events != nil {
+				for _, ev := range events.Events { // 遍历 Events 切片
+					if updated := updateCacheFromEvent(cache, ev, jobName, group); updated {
+						alloc, _ := ev.Allocation()
+						log.Printf("[DEBUG] 接收事件: Topic=%s, AllocID=%s, Type=%s", ev.Type, alloc.ID, ev.Type)
 
-					successful, failed, indicator = checkStatus(cache, group, acceptableStatus)
-					if failed {
-						log.Printf("[ERROR] [%s] 事件触发: 分配失败 (AllocID: %s)", indicator, alloc.ID)
-						return 1
+						successful, failed, indicator := checkStatus(cache, group, acceptableStatus)
+						if failed {
+							log.Printf("[ERROR] [%s] 事件触发: 分配失败 (AllocID: %s)", indicator, alloc.ID)
+							return 1
+						}
+						if successful {
+							log.Printf("[INFO] [%s] 事件触发: 分配成功 (AllocID: %s)", indicator, alloc.ID)
+							return 0
+						}
+						log.Printf("[INFO] [%s] 事件更新: 分配进行中 (AllocID: %s)", indicator, alloc.ID)
 					}
-					if successful {
-						log.Printf("[INFO] [%s] 事件触发: 分配成功 (AllocID: %s)", indicator, alloc.ID)
-						return 0
-					}
-					log.Printf("[INFO] [%s] 事件更新: 分配进行中 (AllocID: %s)", indicator, alloc.ID)
 				}
 			}
 		case <-ticker.C:
