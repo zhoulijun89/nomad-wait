@@ -1,8 +1,8 @@
-module github.com/kirill-shtrykov/nomad-wait
+module github.com/zhoulijun89/nomad-wait
 
 go 1.22.0
 
-require github.com/hashicorp/nomad/api v0.0.0-20240228150404-57af1cdcbf05
+require github.com/hashicorp/nomad/api v1.10.5
 
 require (
 	github.com/alexflint/go-restructure v0.2.0
