@@ -364,7 +364,7 @@ Nomad ACL 认证令牌。
 	log.Printf("[INFO] [%s] 初始检查: 分配进行中", indicator)
 
 	// 步骤 2: 尝试订阅事件流
-	var eventChan <-chan *api.Events // 修正：使用 *api.Events
+	var eventChan <-chan *api.Events
 	const maxRetries = 3
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		events := client.EventStream()
@@ -410,7 +410,7 @@ Nomad ACL 认证令牌。
 			}
 			if ok && events != nil {
 				for _, ev := range events.Events { // 遍历 Events 切片
-					if updated := updateCacheFromEvent(cache, ev, jobName, group); updated {
+					if updated := updateCacheFromEvent(cache, ev, jobName, group); updated { // 传递 *api.Event
 						alloc, _ := ev.Allocation()
 						log.Printf("[DEBUG] 接收事件: Topic=%s, AllocID=%s, Type=%s", ev.Type, alloc.ID, ev.Type)
 
