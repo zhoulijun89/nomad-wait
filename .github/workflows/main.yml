@@ -24,7 +24,7 @@ jobs:
         cache: true
         
     - name: Setup Go MOD
-      run: ｜
+      run: |
         go mod tidy   
 
     - name: Build from single file
