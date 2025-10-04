@@ -3,7 +3,7 @@ module github.com/zhoulijun89/nomad-wait
 go 1.25.1 
 
 require (
-    github.com/hashicorp/nomad/api v1.10.5 
+    github.com/hashicorp/nomad/api 
 	github.com/alexflint/go-restructure v0.2.0
 	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/hashicorp/cronexpr v1.1.2 // indirect
