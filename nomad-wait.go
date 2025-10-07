@@ -21,7 +21,7 @@ import (
 const (
 	STATUS_HEALTHY   = "healthy"   // 健康状态
 	STATUS_UNHEALTHY = "unhealthy" // 不健康状态
-	STATUS_COMPLETE  = "complete"  // 批处理作业完成状态
+	STATUS_COMPLETE  = "complete"  // 批处理作业或主任务完成状态
 	STATUS_FAILED    = "failed"    // 失败状态
 	STATUS_RUNNING   = "running"   // 运行中状态
 )
@@ -34,6 +34,12 @@ type Allocation struct {
 
 // AllocCache 用于缓存分配状态，便于事件更新和检查
 type AllocCache map[string]*Allocation
+
+// TaskConfig 存储任务的 lifecycle 配置
+type TaskConfig struct {
+	Name      string
+	IsSidecar bool
+}
 
 // findAllocation 在分配列表中查找特定任务组和索引的分配
 func findAllocation(allocs []*Allocation, taskGroup string, index int) *Allocation {
@@ -83,28 +89,33 @@ func parseAllocationName(name string) (string, string, int, error) {
 
 	index, err := strconv.Atoi(match[3])
 	if err != nil {
-		return "", "", -1, fmt.Errorf("无法解析分配名称 %s: %v", name, err)
+		return "", "", -1, fmt_Outfmt("无法解析分配名称 %s: %v", name, err)
 	}
 
 	return match[1], match[2], index, nil
 }
 
-// getTaskGroupCount 获取任务组的预期分配数量
-func getTaskGroupCount(client *api.Client, jobName, taskGroup string) (int, error) {
+// getTaskGroupInfo 获取任务组的预期分配数量和任务的 lifecycle 配置
+func getTaskGroupInfo(client *api.Client, jobName, taskGroup string) (int, []TaskConfig, error) {
 	job, _, err := client.Jobs().Info(jobName, &api.QueryOptions{})
 	if err != nil {
-		return 0, fmt.Errorf("无法获取作业 %s 信息: %v", jobName, err)
+		return 0, nil, fmt.Errorf("无法获取作业 %s 信息: %v", jobName, err)
 	}
 	for _, tg := range job.TaskGroups {
 		if *tg.Name == taskGroup {
-			return *tg.Count, nil
+			taskConfigs := make([]TaskConfig, len(tg.Tasks))
+			for i, task := range tg.Tasks {
+				isSidecar := task.Lifecycle != nil && task.Lifecycle.Sidecar != nil && *task.Lifecycle.Sidecar
+				taskConfigs[i] = TaskConfig{Name: task.Name, IsSidecar: isSidecar}
+			}
+			return *tg.Count, taskConfigs, nil
 		}
 	}
-	return 0, fmt.Errorf("任务组 %s 未找到在作业 %s 中", taskGroup, jobName)
+	return 0, nil, fmt.Errorf("任务组 %s 未找到在作业 %s 中", taskGroup, jobName)
 }
 
 // monitoredAllocations 获取匹配作业和任务组的活跃分配列表（用于初始加载或轮询）
-func monitoredAllocations(client *api.Client, jobName, group string, jobType string) ([]*Allocation, error) {
+func monitoredAllocations(client *api.Client, jobName, group string, jobType string, taskConfigs []TaskConfig) ([]*Allocation, error) {
 	var result []*Allocation
 	q := api.QueryOptions{}
 
@@ -123,8 +134,15 @@ func monitoredAllocations(client *api.Client, jobName, group string, jobType str
 			if group != "" && a.TaskGroup != group {
 				continue
 			}
-			// 忽略已终止的分配（非批处理作业）
-			if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
+			// 忽略已终止的分配（非批处理作业，且非主任务）
+			hasSidecar := false
+			for _, tc := range taskConfigs {
+				if tc.IsSidecar {
+					hasSidecar = true
+					break
+				}
+			}
+			if jobType != "batch" && hasSidecar && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
 				continue
 			}
 
@@ -153,9 +171,16 @@ func monitoredAllocations(client *api.Client, jobName, group string, jobType str
 }
 
 // allocationStatus 获取分配的状态
-func allocationStatus(alloc *Allocation) string {
-	if alloc.JobType == "batch" {
-		return alloc.ClientStatus // 批处理作业直接返回 complete 或 failed
+func allocationStatus(alloc *Allocation, taskConfigs []TaskConfig) string {
+	hasSidecar := false
+	for _, tc := range taskConfigs {
+		if tc.IsSidecar {
+			hasSidecar = true
+			break
+		}
+	}
+	if alloc.JobType == "batch" || !hasSidecar {
+		return alloc.ClientStatus // 批处理或主任务返回 complete 或 failed
 	}
 	human_readable := map[bool]string{true: STATUS_HEALTHY, false: STATUS_UNHEALTHY}
 	if alloc.ClientStatus == STATUS_RUNNING && alloc.DeploymentStatus != nil {
@@ -165,7 +190,7 @@ func allocationStatus(alloc *Allocation) string {
 }
 
 // checkStatus 检查缓存中的分配是否达到目标状态
-func checkStatus(cache AllocCache, targetGroup, jobType string, expectedCount int) (bool, bool, string) {
+func checkStatus(cache AllocCache, targetGroup, jobType string, expectedCount int, taskConfigs []TaskConfig) (bool, bool, string) {
 	var indicator string
 	successful := true
 	failed := false
@@ -176,8 +201,8 @@ func checkStatus(cache AllocCache, targetGroup, jobType string, expectedCount in
 		if targetGroup != "" && a.TaskGroup != targetGroup {
 			continue
 		}
-		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
-			continue // 忽略非批处理作业的终止分配
+		if jobType != "batch" && a.ClientStatus == STATUS_FAILED {
+			continue // 忽略失败的分配
 		}
 		activeCount++
 	}
@@ -189,20 +214,27 @@ func checkStatus(cache AllocCache, targetGroup, jobType string, expectedCount in
 	}
 
 	// 检查状态
+	hasSidecar := false
+	for _, tc := range taskConfigs {
+		if tc.IsSidecar {
+			hasSidecar = true
+			break
+		}
+	}
 	for _, a := range cache {
 		if targetGroup != "" && a.TaskGroup != targetGroup {
 			continue
 		}
-		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
-			continue // 忽略非批处理作业的终止分配
+		if jobType != "batch" && a.ClientStatus == STATUS_FAILED {
+			continue // 忽略失败的分配
 		}
 
-		status := allocationStatus(a)
+		status := allocationStatus(a, taskConfigs)
 		log.Printf("[DEBUG] 检查分配 %s (TaskGroup: %s, Index: %d): 状态 %s", a.ID, a.TaskGroup, a.Index, status)
 
 		// 动态确定目标状态
 		acceptableStatus := STATUS_HEALTHY
-		if jobType == "batch" {
+		if jobType == "batch" || !hasSidecar {
 			acceptableStatus = STATUS_COMPLETE
 		}
 
@@ -231,7 +263,7 @@ func checkStatus(cache AllocCache, targetGroup, jobType string, expectedCount in
 }
 
 // updateCacheFromEvent 从事件更新分配缓存
-func updateCacheFromEvent(cache AllocCache, ev *api.Event, jobName, targetGroup, jobType string) bool {
+func updateCacheFromEvent(cache AllocCache, ev *api.Event, jobName, targetGroup, jobType string, taskConfigs []TaskConfig) bool {
 	if ev.Topic != api.TopicAllocation {
 		return false
 	}
@@ -251,8 +283,15 @@ func updateCacheFromEvent(cache AllocCache, ev *api.Event, jobName, targetGroup,
 		return false
 	}
 
-	// 如果不是批处理作业，移除终止的分配
-	if jobType != "batch" && (alloc.ClientStatus == STATUS_COMPLETE || alloc.ClientStatus == STATUS_FAILED) {
+	// 如果不是批处理作业且有 sidecar 任务，移除终止的分配
+	hasSidecar := false
+	for _, tc := range taskConfigs {
+		if tc.IsSidecar {
+			hasSidecar = true
+			break
+		}
+	}
+	if jobType != "batch" && hasSidecar && (alloc.ClientStatus == STATUS_COMPLETE || alloc.ClientStatus == STATUS_FAILED) {
 		delete(cache, alloc.ID)
 		log.Printf("[DEBUG] 移除终止分配: ID=%s, TaskGroup=%s, 状态=%s", alloc.ID, alloc.TaskGroup, alloc.ClientStatus)
 		return true
@@ -260,12 +299,12 @@ func updateCacheFromEvent(cache AllocCache, ev *api.Event, jobName, targetGroup,
 
 	// 更新或添加缓存
 	newAlloc := &Allocation{AllocationListStub: api.AllocationListStub{
-		ID:               alloc.ID,
-		JobID:            alloc.JobID,
-		TaskGroup:        alloc.TaskGroup,
-		ClientStatus:     alloc.ClientStatus,
+		ID:              alloc.ID,
+		JobID:           alloc.JobID,
+		TaskGroup:       alloc.TaskGroup,
+		ClientStatus:    alloc.ClientStatus,
 		DeploymentStatus: alloc.DeploymentStatus,
-		CreateTime:       alloc.CreateTime,
+		CreateTime:      alloc.CreateTime,
 	}}
 	_, _, index, err := parseAllocationName(alloc.Name)
 	if err == nil {
@@ -356,7 +395,7 @@ Nomad ACL 认证令牌。
 		return 1
 	}
 
-	// 获取作业类型和任务组 count
+	// 获取作业类型和任务组信息
 	job, _, err := client.Jobs().Info(jobName, &api.QueryOptions{})
 	if err != nil {
 		log.Printf("[ERROR] 获取作业 %s 信息失败: %v", jobName, err)
@@ -364,14 +403,26 @@ Nomad ACL 认证令牌。
 	}
 	jobType := *job.Type
 	expectedCount := 0
+	taskConfigs := []TaskConfig{}
 	if group != "" {
-		count, err := getTaskGroupCount(client, jobName, group)
+		count, configs, err := getTaskGroupInfo(client, jobName, group)
 		if err != nil {
 			log.Printf("[ERROR] %v", err)
 			return 1
 		}
 		expectedCount = count
-		log.Printf("[INFO] 任务组 %s 的预期分配数量: %d", group, expectedCount)
+		taskConfigs = configs
+		log.Printf("[INFO] 任务组 %s 的预期分配数量: %d, 任务配置: %+v", group, expectedCount, taskConfigs)
+	} else {
+		// 如果未指定 group，检查所有任务组的 count 总和
+		for _, tg := range job.TaskGroups {
+			expectedCount += *tg.Count
+			for _, task := range tg.Tasks {
+				isSidecar := task.Lifecycle != nil && task.Lifecycle.Sidecar != nil && *task.Lifecycle.Sidecar
+				taskConfigs = append(taskConfigs, TaskConfig{Name: task.Name, IsSidecar: isSidecar})
+			}
+		}
+		log.Printf("[INFO] 作业 %s 的总预期分配数量: %d, 任务配置: %+v", jobName, expectedCount, taskConfigs)
 	}
 
 	// 打印启动信息
@@ -400,7 +451,7 @@ Nomad ACL 认证令牌。
 
 	// 步骤 1: 初始状态检查
 	log.Printf("[INFO] 执行初始分配状态检查...")
-	allocs, err := monitoredAllocations(client, jobName, group, jobType)
+	allocs, err := monitoredAllocations(client, jobName, group, jobType, taskConfigs)
 	if err != nil {
 		log.Printf("[ERROR] 初始分配查询失败: %v", err)
 		return 1
@@ -429,7 +480,7 @@ Nomad ACL 认证令牌。
 		log.Printf("[INFO] 检测到 batch 作业，使用目标状态: %s", acceptableStatus)
 	}
 
-	successful, failed, indicator := checkStatus(cache, group, jobType, expectedCount)
+	successful, failed, indicator := checkStatus(cache, group, jobType, expectedCount, taskConfigs)
 	if failed {
 		log.Printf("[ERROR] [%s] 初始检查: 分配失败", indicator)
 		return 1
@@ -487,21 +538,22 @@ Nomad ACL 认证令牌。
 			}
 			if ok && events != nil {
 				for _, ev := range events.Events {
-					if updated := updateCacheFromEvent(cache, &ev, jobName, group, jobType); updated {
+					if updated := updateCacheFromEvent(cache, ev, jobName, group, jobType, taskConfigs); updated {
 						alloc, _ := ev.Allocation()
 						log.Printf("[DEBUG] 接收事件: Topic=%s, AllocID=%s, Type=%s", ev.Topic, alloc.ID, ev.Type)
 
-						// 重新获取任务组 count（应对动态变化）
+						// 重新获取任务组信息（应对动态变化）
 						if group != "" {
-							count, err := getTaskGroupCount(client, jobName, group)
+							count, configs, err := getTaskGroupInfo(client, jobName, group)
 							if err != nil {
-								log.Printf("[ERROR] 获取任务组 count 失败: %v", err)
+								log.Printf("[ERROR] 获取任务组信息失败: %v", err)
 							} else {
 								expectedCount = count
+								taskConfigs = configs
 							}
 						}
 
-						successful, failed, indicator := checkStatus(cache, group, jobType, expectedCount)
+						successful, failed, indicator := checkStatus(cache, group, jobType, expectedCount, taskConfigs)
 						if failed {
 							log.Printf("[ERROR] [%s] 事件触发: 分配失败 (AllocID: %s)", indicator, alloc.ID)
 							return 1
@@ -518,7 +570,7 @@ Nomad ACL 认证令牌。
 			elapsed += 2
 			// 如果事件流不可用，使用轮询
 			if eventChan == nil {
-				allocs, err := monitoredAllocations(client, jobName, group, jobType)
+				allocs, err := monitoredAllocations(client, jobName, group, jobType, taskConfigs)
 				if err != nil {
 					log.Printf("[ERROR] 轮询分配列表失败: %v", err)
 					return 1
@@ -529,18 +581,19 @@ Nomad ACL 认证令牌。
 				}
 				log.Printf("[DEBUG] 轮询更新缓存: %d 个分配", len(cache))
 
-				// 重新获取任务组 count
+				// 重新获取任务组信息
 				if group != "" {
-					count, err := getTaskGroupCount(client, jobName, group)
+					count, configs, err := getTaskGroupInfo(client, jobName, group)
 					if err != nil {
-						log.Printf("[ERROR] 获取任务组 count 失败: %v", err)
+						log.Printf("[ERROR] 获取任务组信息失败: %v", err)
 					} else {
 						expectedCount = count
+						taskConfigs = configs
 					}
 				}
 			}
 
-			successful, failed, indicator := checkStatus(cache, group, jobType, expectedCount)
+			successful, failed, indicator := checkStatus(cache, group, jobType, expectedCount, taskConfigs)
 			if failed {
 				log.Printf("[ERROR] [%s] 进度检查: 分配失败", indicator)
 				return 1
