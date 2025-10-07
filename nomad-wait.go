@@ -538,7 +538,7 @@ Nomad ACL 认证令牌。
 			}
 			if ok && events != nil {
 				for _, ev := range events.Events {
-					if updated := updateCacheFromEvent(cache, ev, jobName, group, jobType, taskConfigs); updated {
+					if updated := updateCacheFromEvent(cache, &ev, jobName, group, jobType, taskConfigs); updated {
 						alloc, _ := ev.Allocation()
 						log.Printf("[DEBUG] 接收事件: Topic=%s, AllocID=%s, Type=%s", ev.Topic, alloc.ID, ev.Type)
 
