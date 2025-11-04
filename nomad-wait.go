@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -16,300 +17,620 @@ import (
 	"github.com/hashicorp/nomad/api"
 )
 
+// 定义分配状态的常量，用于判断 allocation 的健康或完成状态
 const (
-	WaitModeAny = "any"
-	WaitModeAll = "all"
+	STATUS_HEALTHY   = "healthy"   // 健康状态
+	STATUS_UNHEALTHY = "unhealthy" // 不健康状态
+	STATUS_COMPLETE  = "complete"  // 批处理作业完成状态
+	STATUS_FAILED    = "failed"    // 失败状态
+	STATUS_RUNNING   = "running"   // 运行中状态
 )
 
-type Alloc struct {
-	*api.Allocation
-	Index int
+// Allocation 结构体，扩展 Nomad 的 AllocationListStub，增加索引字段
+type Allocation struct {
+	api.AllocationListStub
+	Index int // 从分配名称解析得到的索引
 }
 
-type AllocCache map[string]*Alloc
+// AllocCache 用于缓存分配状态，便于事件更新和检查
+type AllocCache map[string]*Allocation
 
-// 环境变量
-func env(key, def string) string {
+// findAllocation 在分配列表中查找特定任务组和索引的分配
+func findAllocation(allocs []*Allocation, taskGroup string, index int) *Allocation {
+	for _, alloc := range allocs {
+		if alloc.TaskGroup == taskGroup && alloc.Index == index {
+			return alloc
+		}
+	}
+	return nil
+}
+
+// stringFromEnv 从环境变量读取字符串值，若未设置或为空则返回默认值
+func stringFromEnv(key string, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return strings.TrimSpace(v)
 	}
 	return def
 }
-func envInt(key string, def int) int {
+
+// intFromEnv 从环境变量读取整数值，若解析失败则返回错误
+func intFromEnv(key string, def int) (int, error) {
 	if v := os.Getenv(key); v != "" {
-		if i, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
-			return i
+		i, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return def, fmt.Errorf("错误解析环境变量 %s: %v", key, err)
 		}
+		return i, nil
 	}
-	return def
+	return def, nil
 }
 
-// 解析 [index]
-func parseIndex(name string) int {
-	re := regexp.MustCompile(`\[(\d+)\]`)
-	if m := re.FindStringSubmatch(name); len(m) > 1 {
-		i, _ := strconv.Atoi(m[1])
-		return i
+// jobNameFromArgs 解析命令行参数以获取作业名称
+func jobNameFromArgs(args []string) (string, error) {
+	if len(args) == 0 || len(args) > 1 {
+		return "", errors.New("参数数量不正确")
 	}
-	return -1
+	return args[0], nil
 }
 
-// 是否 sidecar
-func isSidecar(task *api.Task) bool {
-	if task == nil || task.Config == nil {
-		return false
+// parseAllocationName 解析分配名称，提取作业ID、任务组和索引
+func parseAllocationName(name string) (string, string, int, error) {
+	nameRegexp := regexp.MustCompile(`([\w-]+)\.([\w-]+)\[(\d+)\]`)
+	match := nameRegexp.FindStringSubmatch(name)
+	if len(match) == 0 {
+		return "", "", -1, fmt.Errorf("无法解析分配名称 %s", name)
 	}
-	_, ok := task.Config["sidecar"]
-	return ok
+
+	index, err := strconv.Atoi(match[3])
+	if err != nil {
+		return "", "", -1, fmt.Errorf("无法解析分配名称 %s: %v", name, err)
+	}
+
+	return match[1], match[2], index, nil
 }
 
-// 是否健康
-func isHealthy(alloc *api.Allocation) bool {
-	return alloc.ClientStatus == "running" &&
-		alloc.DeploymentStatus != nil &&
-		alloc.DeploymentStatus.Healthy != nil &&
-		*alloc.DeploymentStatus.Healthy
-}
-
-// 是否完成
-func isComplete(alloc *api.Allocation) bool {
-	return alloc.ClientStatus == "complete"
-}
-
-// 获取任务组 Count
-func getGroupCount(client *api.Client, jobName, group string) (int, error) {
+// getTaskGroupCount 获取任务组的预期分配数量
+func getTaskGroupCount(client *api.Client, jobName, taskGroup string) (int, error) {
 	job, _, err := client.Jobs().Info(jobName, &api.QueryOptions{})
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("无法获取作业 %s 信息: %v", jobName, err)
 	}
 	for _, tg := range job.TaskGroups {
-		if *tg.Name == group {
+		if *tg.Name == taskGroup {
 			return *tg.Count, nil
 		}
 	}
-	return 0, fmt.Errorf("group not found")
+	return 0, fmt.Errorf("任务组 %s 未找到在作业 %s 中", taskGroup, jobName)
 }
 
-// 加载所有活跃分配
-func loadAllocs(client *api.Client, jobName, group string) (AllocCache, error) {
-	// 获取最新 Job 版本
-	job, _, err := client.Jobs().Info(jobName, nil)
-	if err != nil {
-		return nil, err
-	}
-	latestVersion := *job.Version
+// monitoredAllocations 获取匹配作业和任务组的活跃分配列表（用于初始加载或轮询）
+func monitoredAllocations(client *api.Client, jobName, group string, jobType string) ([]*Allocation, error) {
+	var result []*Allocation
+	q := api.QueryOptions{}
 
-	stubs, _, err := client.Jobs().Allocations(jobName, true, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	cache := make(AllocCache)
-	for _, stub := range stubs {
-		if group != "" && stub.TaskGroup != group {
-			continue
-		}
-		// 跳过旧版本的 complete
-		if stub.ClientStatus == "complete" && stub.JobVersion < latestVersion {
-			continue
-		}
-
-		full, _, err := client.Allocations().Info(stub.ID, nil)
+	// 获取分配列表（支持分页）
+	var nextToken string
+	for {
+		allocs, meta, err := client.Allocations().List(&q)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("无法从 Nomad 服务器获取分配列表: %v", err)
 		}
 
-		cache[full.ID] = &Alloc{full, parseIndex(full.Name)}
-	}
-	return cache, nil
-}
-
-// 检查状态
-func checkStatus(
-	cache AllocCache,
-	group string,
-	jobType string,
-	expectedCount int,
-	mode string,
-) (success, failed bool, healthy, total int, indicator string) {
-
-	healthy = 0
-	total = len(cache)
-	ind := strings.Builder{}
-	failed = false
-
-	for _, a := range cache {
-		if group != "" && a.TaskGroup != group {
-			continue
-		}
-
-		if a.ClientStatus == "failed" {
-			ind.WriteString("!")
-			failed = true
-			continue
-		}
-
-		// 获取任务组定义
-		tg, _, err := api.NewClient(api.DefaultConfig()).JobTaskGroups().Info(a.JobID, a.TaskGroup, nil)
-		if err != nil {
-			ind.WriteString("?")
-			continue
-		}
-
-		isSidecarTask := false
-		for _, task := range tg.Tasks {
-			if isSidecar(task) {
-				isSidecarTask = true
-				break
+		for _, a := range allocs {
+			if a.JobID != jobName {
+				continue
 			}
-		}
-
-		ok := false
-		if isSidecarTask {
-			if isHealthy(a.Allocation) {
-				ok = true
+			if group != "" && a.TaskGroup != group {
+				continue
 			}
-		} else {
-			if jobType == "batch" {
-				if isComplete(a.Allocation) {
-					ok = true
+			// 忽略已终止的分配（非批处理作业）
+			if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
+				continue
+			}
+
+			_, _, index, err := parseAllocationName(a.Name)
+			if err != nil {
+				return nil, err
+			}
+
+			if alloc := findAllocation(result, a.TaskGroup, index); alloc != nil {
+				if alloc.CreateTime < a.CreateTime {
+					alloc = &Allocation{*a, index}
 				}
 			} else {
-				if isHealthy(a.Allocation) {
-					ok = true
-				}
+				result = append(result, &Allocation{*a, index})
 			}
 		}
 
-		if ok {
-			ind.WriteString("+")
-			healthy++
-		} else {
-			ind.WriteString("-")
+		if meta.NextToken == "" {
+			break
 		}
+		nextToken = meta.NextToken
+		q.NextToken = nextToken
 	}
 
-	indicator = ind.String()
-
-	switch mode {
-	case WaitModeAny:
-		success = healthy > 0
-	case WaitModeAll:
-		success = healthy == expectedCount && expectedCount > 0
-	}
-
-	return
+	return result, nil
 }
 
-func main() {
-	// 参数
-	addr := flag.String("address", env("NOMAD_ADDR", "http://127.0.0.1:4646"), "Nomad address")
-	timeout := flag.Int("t", envInt("NOMAD_JOB_TIMEOUT", 0), "timeout (s)")
-	group := flag.String("group", env("NOMAD_TASK_GROUP", ""), "task group")
-	token := flag.String("token", env("NOMAD_TOKEN", ""), "ACL token")
-	mode := flag.String("mode", env("NOMAD_WAIT_MODE", WaitModeAny), "any|all")
-	flag.Parse()
+// allocationStatus 获取分配的状态
+func allocationStatus(alloc *Allocation) string {
+	if alloc.JobType == "batch" {
+		return alloc.ClientStatus // 批处理作业直接返回 complete 或 failed
+	}
+	human_readable := map[bool]string{true: STATUS_HEALTHY, false: STATUS_UNHEALTHY}
+	if alloc.ClientStatus == STATUS_RUNNING && alloc.DeploymentStatus != nil {
+		return human_readable[*alloc.DeploymentStatus.Healthy]
+	}
+	return alloc.ClientStatus
+}
 
-	*mode = strings.ToLower(*mode)
-	if *mode != WaitModeAny && *mode != WaitModeAll {
-		*mode = WaitModeAny
+// checkStatus 检查缓存中的分配是否达到目标状态
+func checkStatus(cache AllocCache, targetGroup, jobType, mode string, expectedCount int) (bool, bool, string) {
+	var indicator string
+	successful := false
+	failed := false
+	activeCount := 0
+	healthyCount := 0
+
+	mode = strings.ToLower(mode)
+
+	// 统计活跃分配
+	for _, a := range cache {
+		if targetGroup != "" && a.TaskGroup != targetGroup {
+			continue
+		}
+		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
+			continue
+		}
+		activeCount++
 	}
 
-	if len(flag.Args()) != 1 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <job>\n", os.Args[0])
-		flag.PrintDefaults()
-		os.Exit(1)
-	}
-	jobName := flag.Arg(0)
-
-	// 客户端
-	config := api.DefaultConfig()
-	config.Address = *addr
-	config.SecretID = *token
-	client, err := api.NewClient(config)
-	if err != nil {
-		log.Fatalf("Client error: %v", err)
+	// 检查活跃分配数量是否符合预期
+	if expectedCount > 0 && activeCount < expectedCount {
+		log.Printf("[DEBUG] 活跃分配数量 %d 小于预期 %d，等待更多分配", activeCount, expectedCount)
+		return false, false, strings.Repeat("-", activeCount)
 	}
 
-	// 作业信息
-	job, _, err := client.Jobs().Info(jobName, nil)
-	if err != nil {
-		log.Fatalf("Job not found: %v", err)
-	}
-	jobType := *job.Type
+	// 检查每个分配状态
+	for _, a := range cache {
+		if targetGroup != "" && a.TaskGroup != targetGroup {
+			continue
+		}
+		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
+			continue
+		}
 
-	// 预期数量
-	expectedCount := 0
-	if *group != "" {
-		expectedCount, _ = getGroupCount(client, jobName, *group)
-	} else {
-		for _, tg := range job.TaskGroups {
-			expectedCount += *tg.Count
+		status := allocationStatus(a)
+		log.Printf("[DEBUG] 检查分配 %s (Index: %d): 状态 %s", a.ID, a.Index, status)
+
+		acceptableStatus := STATUS_HEALTHY
+		if jobType == "batch" {
+			acceptableStatus = STATUS_COMPLETE
+		}
+
+		if status == STATUS_FAILED {
+			failed = true
+			indicator += "!"
+			continue
+		}
+
+		if status == acceptableStatus {
+			indicator += "+"
+			healthyCount++
+		} else {
+			indicator += "-"
 		}
 	}
 
-	tgName := "all"
-	if *group != "" {
-		tgName = *group
+	// 根据模式判断成功
+	if mode == "any" {
+		if healthyCount >= 1 {
+			successful = true
+		}
+	} else { // mode == "all"
+		if healthyCount == activeCount && activeCount > 0 {
+			successful = true
+		}
 	}
-	log.Printf("WAIT job='%s' mode=%s group=%s expect=%d", jobName, *mode, tgName, expectedCount)
 
-	// 上下文
+	return successful, failed, indicator
+}
+
+// checkStatus 检查缓存中的分配是否达到目标状态
+/*func checkStatus(cache AllocCache, targetGroup, jobType string, expectedCount int) (bool, bool, string) {
+	var indicator string
+	successful := true
+	failed := false
+	activeCount := 0
+
+	// 统计活跃分配
+	for _, a := range cache {
+		if targetGroup != "" && a.TaskGroup != targetGroup {
+			continue
+		}
+		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
+			continue // 忽略非批处理作业的终止分配
+		}
+		activeCount++
+	}
+
+	// 检查活跃分配数量是否符合预期
+	if expectedCount > 0 && activeCount < expectedCount {
+		log.Printf("[DEBUG] 活跃分配数量 %d 小于预期 %d，等待更多分配", activeCount, expectedCount)
+		return false, false, strings.Repeat("-", activeCount)
+	}
+
+	// 检查状态
+	for _, a := range cache {
+		if targetGroup != "" && a.TaskGroup != targetGroup {
+			continue
+		}
+		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
+			continue // 忽略非批处理作业的终止分配
+		}
+
+		status := allocationStatus(a)
+		log.Printf("[DEBUG] 检查分配 %s (TaskGroup: %s, Index: %d): 状态 %s", a.ID, a.TaskGroup, a.Index, status)
+
+		// 动态确定目标状态
+		acceptableStatus := STATUS_HEALTHY
+		if jobType == "batch" {
+			acceptableStatus = STATUS_COMPLETE
+		}
+
+		if status == STATUS_FAILED {
+			failed = true
+			indicator += "!"
+			successful = false
+			continue
+		}
+
+		if status == acceptableStatus {
+			indicator += "+"
+			continue
+		}
+
+		indicator += "-"
+		successful = false
+	}
+
+	// 如果有至少 1 个符合目标状态，且数量满足预期，认为是成功
+	if strings.Contains(indicator, "+") && activeCount <= expectedCount {
+		successful = true
+	}
+
+	return successful, failed, indicator
+}*/
+
+// updateCacheFromEvent 从事件更新分配缓存
+func updateCacheFromEvent(cache AllocCache, ev *api.Event, jobName, targetGroup, jobType string) bool {
+	if ev.Topic != api.TopicAllocation {
+		return false
+	}
+
+	// 解码事件 payload 为 Allocation
+	alloc, err := ev.Allocation()
+	if err != nil {
+		log.Printf("[ERROR] 解码事件 payload 失败: %v", err)
+		return false
+	}
+
+	if alloc == nil || alloc.JobID != jobName {
+		return false
+	}
+
+	if targetGroup != "" && alloc.TaskGroup != targetGroup {
+		return false
+	}
+
+	// 如果不是批处理作业，移除终止的分配
+	if jobType != "batch" && (alloc.ClientStatus == STATUS_COMPLETE || alloc.ClientStatus == STATUS_FAILED) {
+		delete(cache, alloc.ID)
+		log.Printf("[DEBUG] 移除终止分配: ID=%s, TaskGroup=%s, 状态=%s", alloc.ID, alloc.TaskGroup, alloc.ClientStatus)
+		return true
+	}
+
+	// 更新或添加缓存
+	newAlloc := &Allocation{AllocationListStub: api.AllocationListStub{
+		ID:               alloc.ID,
+		JobID:            alloc.JobID,
+		TaskGroup:        alloc.TaskGroup,
+		ClientStatus:     alloc.ClientStatus,
+		DeploymentStatus: alloc.DeploymentStatus,
+		CreateTime:       alloc.CreateTime,
+	}}
+	_, _, index, err := parseAllocationName(alloc.Name)
+	if err == nil {
+		newAlloc.Index = index
+	}
+	cache[alloc.ID] = newAlloc
+
+	log.Printf("[DEBUG] 更新分配缓存: ID=%s, TaskGroup=%s, 新状态=%s", alloc.ID, alloc.TaskGroup, alloc.ClientStatus)
+	return true
+}
+
+// setupLogger 设置日志级别
+func setupLogger() {
+	level := stringFromEnv("NOMAD_LOG_LEVEL", "info")
+	switch strings.ToLower(level) {
+	case "debug":
+		log.SetFlags(log.LstdFlags | log.Lshortfile)
+	case "error":
+		log.SetFlags(log.LstdFlags)
+	default:
+		log.SetFlags(log.LstdFlags)
+	}
+	log.Printf("[INFO] 日志级别设置为 %s", level)
+}
+
+// Run 主逻辑函数，执行等待作业或任务组健康状态的逻辑（优先事件流，回退轮询）
+func Run() int {
+	setupLogger() // 初始化日志
+
+	var timeout int
+	var group string
+	var token string
+	var err error
+	var waitMode string
+
+	// 定义命令行标志的帮助文本
+	addressHelpText := `
+Nomad 服务器地址。
+如果设置了 NOMAD_ADDR 环境变量，将被覆盖。
+默认值 = http://127.0.0.1:4646 
+	`
+	timeoutHelpText := `
+等待超时时间（秒，0 表示永不超时）。
+如果设置了 NOMAD_JOB_TIMEOUT 环境变量，将被覆盖。
+默认值 = 0（无限等待）
+	`
+	groupHelpText := `
+要等待健康状态的特定任务组（可选）。
+如果未设置，等待作业中所有任务组。
+如果设置了 NOMAD_TASK_GROUP 环境变量，将被覆盖。
+	`
+	tokenHelpText := `
+Nomad ACL 认证令牌。
+如果设置了 NOMAD_TOKEN 环境变量，将被覆盖。
+	`
+
+	nomadConfig := api.DefaultConfig()
+
+	// 定义命令行标志
+	flag.StringVar(&nomadConfig.Address, "address", stringFromEnv("NOMAD_ADDR", "http://127.0.0.1:4646"), strings.TrimSpace(addressHelpText))
+	flag.IntVar(&timeout, "timeout", 0, strings.TrimSpace(timeoutHelpText)) // 默认永不超时
+	flag.IntVar(&timeout, "t", 0, strings.TrimSpace(timeoutHelpText))
+	flag.StringVar(&group, "group", stringFromEnv("NOMAD_TASK_GROUP", ""), strings.TrimSpace(groupHelpText))
+	flag.StringVar(&token, "token", stringFromEnv("NOMAD_TOKEN", ""), strings.TrimSpace(tokenHelpText))
+	flag.StringVar(&waitMode, "m", "all", "等待模式: 'all' 或 'any'")
+	flag.Parse()
+
+	// 覆盖环境变量到 timeout
+	if envTimeout, err := intFromEnv("NOMAD_JOB_TIMEOUT", timeout); err == nil {
+		timeout = envTimeout
+	} else {
+		log.Printf("[ERROR] %v", err)
+		return 1
+	}
+
+	// 解析作业名称
+	jobName, err := jobNameFromArgs(flag.Args())
+	if err != nil {
+		log.Printf("[ERROR] %v", err)
+		fmt.Printf("用法: %s [参数] <作业名称>\n", os.Args[0])
+		flag.PrintDefaults()
+		return 1
+	}
+
+	// 设置 ACL 令牌
+	nomadConfig.SecretID = token
+	client, err := api.NewClient(nomadConfig)
+	if err != nil {
+		log.Printf("[ERROR] 创建 Nomad 客户端失败: %v", err)
+		return 1
+	}
+
+	// 获取作业类型和任务组 count
+	job, _, err := client.Jobs().Info(jobName, &api.QueryOptions{})
+	if err != nil {
+		log.Printf("[ERROR] 获取作业 %s 信息失败: %v", jobName, err)
+		return 1
+	}
+	jobType := *job.Type
+	expectedCount := 0
+	if group != "" {
+		count, err := getTaskGroupCount(client, jobName, group)
+		if err != nil {
+			log.Printf("[ERROR] %v", err)
+			return 1
+		}
+		expectedCount = count
+		log.Printf("[INFO] 任务组 %s 的预期分配数量: %d", group, expectedCount)
+	}
+
+	// 打印启动信息
+	groupMsg := "所有任务组"
+	if group != "" {
+		groupMsg = fmt.Sprintf("任务组 '%s'", group)
+	}
+	if timeout == 0 {
+		log.Printf("[INFO] 无限期等待 Nomad 作业 '%s' (%s) - 尝试事件流监控", jobName, groupMsg)
+	} else {
+		log.Printf("[INFO] 等待 Nomad 作业 '%s' (%s) %d 秒 - 尝试事件流监控", jobName, groupMsg, timeout)
+	}
+
+	// 创建上下文以支持取消
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	go func() { <-sig; log.Println("Interrupted"); cancel() }()
 
-	// 超时
-	var timeoutCh <-chan time.Time
-	if *timeout > 0 {
-		timeoutCh = time.After(time.Duration(*timeout) * time.Second)
+	// 处理信号（如 Ctrl+C）
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Printf("[INFO] 接收到中断信号，退出")
+		cancel()
+	}()
+
+	// 步骤 1: 初始状态检查
+	log.Printf("[INFO] 执行初始分配状态检查...")
+	allocs, err := monitoredAllocations(client, jobName, group, jobType)
+	if err != nil {
+		log.Printf("[ERROR] 初始分配查询失败: %v", err)
+		return 1
 	}
 
-	// 事件流
-	es := client.EventStream()
-	eventCh, _ := es.Stream(ctx, map[api.Topic][]string{api.TopicAllocation: {jobName}}, 0, nil)
+	if len(allocs) == 0 {
+		msg := fmt.Sprintf("未找到作业 '%s' 的分配", jobName)
+		if group != "" {
+			msg += fmt.Sprintf(" 在任务组 '%s' 中", group)
+		}
+		log.Printf("[ERROR] %s", msg)
+		return 1
+	}
 
-	ticker := time.NewTicker(2 * time.Second)
+	// 构建初始缓存
+	cache := make(AllocCache)
+	for _, a := range allocs {
+		cache[a.ID] = a
+	}
+	log.Printf("[INFO] 初始缓存加载 %d 个分配", len(cache))
+
+	// 初始检查
+	acceptableStatus := STATUS_HEALTHY
+	if jobType == "batch" {
+		acceptableStatus = STATUS_COMPLETE
+		log.Printf("[INFO] 检测到 batch 作业，使用目标状态: %s", acceptableStatus)
+	}
+
+	successful, failed, indicator := checkStatus(cache, group, jobType, waitMode, expectedCount)
+	if failed {
+		log.Printf("[ERROR] [%s] 初始检查: 分配失败", indicator)
+		return 1
+	}
+	if successful {
+		log.Printf("[INFO] [%s] 初始检查: 分配已成功", indicator)
+		return 0
+	}
+	log.Printf("[INFO] [%s] 初始检查: 分配进行中", indicator)
+
+	// 步骤 2: 尝试订阅事件流
+	var eventChan <-chan *api.Events
+	const maxRetries = 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		es := client.EventStream()
+		var err error
+		eventChan, err = es.Stream(ctx, map[api.Topic][]string{api.TopicAllocation: {jobName}}, 0, &api.QueryOptions{})
+		if err == nil {
+			log.Printf("[INFO] 事件流订阅成功，等待相关事件...")
+			break
+		}
+		log.Printf("[WARN] 事件流订阅失败 (尝试 %d/%d): %v", attempt, maxRetries, err)
+		if attempt == maxRetries {
+			log.Printf("[ERROR] 事件流订阅失败，切换到轮询模式")
+			eventChan = nil
+		}
+		time.Sleep(time.Second * time.Duration(attempt))
+	}
+
+	// 超时通道
+	var timeoutChan <-chan time.Time
+	if timeout > 0 {
+		timeoutChan = time.After(time.Duration(timeout) * time.Second)
+	}
+
+	// 主循环：优先事件流，失败则轮询
+	var elapsed int
+	ticker := time.NewTicker(2 * time.Second) // 轮询间隔 2 秒
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			os.Exit(1)
-		case <-timeoutCh:
-			log.Printf("TIMEOUT after %ds", *timeout)
-			os.Exit(1)
+			log.Printf("[INFO] 上下文取消，退出")
+			return 1
+		case <-timeoutChan:
+			if timeout > 0 {
+				log.Printf("[ERROR] 事件等待超时 (%d 秒)", timeout)
+				return 1
+			}
+		case events, ok := <-eventChan:
+			if !ok && eventChan != nil {
+				log.Printf("[ERROR] 事件通道关闭，切换到轮询模式")
+				eventChan = nil
+			}
+			if ok && events != nil {
+				for _, ev := range events.Events {
+					if updated := updateCacheFromEvent(cache, &ev, jobName, group, jobType); updated {
+						alloc, _ := ev.Allocation()
+						log.Printf("[DEBUG] 接收事件: Topic=%s, AllocID=%s, Type=%s", ev.Topic, alloc.ID, ev.Type)
 
+						// 重新获取任务组 count（应对动态变化）
+						if group != "" {
+							count, err := getTaskGroupCount(client, jobName, group)
+							if err != nil {
+								log.Printf("[ERROR] 获取任务组 count 失败: %v", err)
+							} else {
+								expectedCount = count
+							}
+						}
+
+						successful, failed, indicator := checkStatus(cache, group, jobType, waitMode, expectedCount)
+						if failed {
+							log.Printf("[ERROR] [%s] 事件触发: 分配失败 (AllocID: %s)", indicator, alloc.ID)
+							return 1
+						}
+						if successful {
+							log.Printf("[INFO] [%s] 事件触发: 分配成功 (AllocID: %s)", indicator, alloc.ID)
+							return 0
+						}
+						log.Printf("[INFO] [%s] 事件更新: 分配进行中 (AllocID: %s)", indicator, alloc.ID)
+					}
+				}
+			}
 		case <-ticker.C:
-			cache, err := loadAllocs(client, jobName, *group)
-			if err != nil {
-				log.Printf("Load error: %v", err)
-				continue
+			elapsed += 2
+			// 如果事件流不可用，使用轮询
+			if eventChan == nil {
+				allocs, err := monitoredAllocations(client, jobName, group, jobType)
+				if err != nil {
+					log.Printf("[ERROR] 轮询分配列表失败: %v", err)
+					return 1
+				}
+				cache = make(AllocCache)
+				for _, a := range allocs {
+					cache[a.ID] = a
+				}
+				log.Printf("[DEBUG] 轮询更新缓存: %d 个分配", len(cache))
+
+				// 重新获取任务组 count
+				if group != "" {
+					count, err := getTaskGroupCount(client, jobName, group)
+					if err != nil {
+						log.Printf("[ERROR] 获取任务组 count 失败: %v", err)
+					} else {
+						expectedCount = count
+					}
+				}
 			}
 
-			success, failed, healthy, total, ind := checkStatus(cache, *group, jobType, expectedCount, *mode)
-
-			log.Printf("[%s] group=%s expect=%d healthy=%d/%d", ind, tgName, expectedCount, healthy, total)
-
+			successful, failed, indicator := checkStatus(cache, group, jobType, waitMode, expectedCount)
 			if failed {
-				log.Println("FAILED: detected failed allocs")
-				os.Exit(1)
+				log.Printf("[ERROR] [%s] 进度检查: 分配失败", indicator)
+				return 1
 			}
-			if success {
-				log.Printf("SUCCESS: %d/%d healthy", healthy, expectedCount)
-				os.Exit(0)
+			if successful {
+				log.Printf("[INFO] [%s] 进度检查: 分配成功", indicator)
+				return 0
 			}
-
-		case events, ok := <-eventCh:
-			if !ok {
-				eventCh = nil
-				log.Println("Event stream lost, polling")
-			}
-			if events != nil && len(events.Events) > 0 {
-				continue
+			if elapsed%10 == 0 {
+				log.Printf("[INFO] [%s] 等待中，耗时 %ds (缓存大小: %d, 预期数量: %d)", indicator, elapsed, len(cache), expectedCount)
 			}
 		}
 	}
+}
+
+// main 入口函数，调用 Run 并设置退出码
+func main() {
+	os.Exit(Run())
 }
