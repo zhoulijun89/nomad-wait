@@ -311,7 +311,11 @@ func Run() int {
 		expectedCount, _ = getTaskGroupCount(client, jobName, group)
 	}
 
-	log.Printf("[INFO] 等待作业 '%s' (%s 模式) - 任务组: %s", jobName, waitMode, group == "" ? "全部" : group)
+	taskGroup := "全部"
+	if group != "" {
+		taskGroup = group
+	}
+	log.Printf("[INFO] 等待作业 '%s' (%s 模式) - 任务组: %s", jobName, waitMode, taskGroup)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
