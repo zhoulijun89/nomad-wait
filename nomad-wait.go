@@ -135,17 +135,19 @@ func monitoredAllocations(client *api.Client, jobName, group, jobType string) ([
 }
 
 // 获取分配状态（健康/完成）
-func allocationStatus(alloc *Allocation, jobType string) string {
+func allocationStatus(a *Allocation, jobType string) string {
 	if jobType == "batch" {
-		return alloc.ClientStatus
+		return a.ClientStatus
 	}
-	if alloc.ClientStatus == STATUS_RUNNING && alloc.DeploymentStatus != nil && alloc.DeploymentStatus.Healthy != nil {
-		if *alloc.DeploymentStatus.Healthy {
-			return STATUS_HEALTHY
-		}
-		return STATUS_UNHEALTHY
+	// 必须满足：running + 有部署状态 + Healthy 明确为 true
+	if a.ClientStatus == "running" &&
+		a.DeploymentStatus != nil &&
+		a.DeploymentStatus.Healthy != nil &&
+		*a.DeploymentStatus.Healthy {
+		return STATUS_HEALTHY
 	}
-	return alloc.ClientStatus
+	// 其他情况一律视为不健康（包括 Degraded）
+	return STATUS_UNHEALTHY
 }
 
 // checkStatus 支持 any/all 模式
