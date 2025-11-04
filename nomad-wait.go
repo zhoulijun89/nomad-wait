@@ -63,7 +63,7 @@ func isSidecar(task *api.Task) bool {
 	return ok
 }
 
-// 是否健康（服务）
+// 是否健康
 func isHealthy(alloc *api.Allocation) bool {
 	return alloc.ClientStatus == "running" &&
 		alloc.DeploymentStatus != nil &&
@@ -71,7 +71,7 @@ func isHealthy(alloc *api.Allocation) bool {
 		*alloc.DeploymentStatus.Healthy
 }
 
-// 是否完成（批处理）
+// 是否完成
 func isComplete(alloc *api.Allocation) bool {
 	return alloc.ClientStatus == "complete"
 }
@@ -90,8 +90,15 @@ func getGroupCount(client *api.Client, jobName, group string) (int, error) {
 	return 0, fmt.Errorf("group not found")
 }
 
-// 加载所有活跃分配（完整信息）
+// 加载所有活跃分配
 func loadAllocs(client *api.Client, jobName, group string) (AllocCache, error) {
+	// 获取最新 Job 版本
+	job, _, err := client.Jobs().Info(jobName, nil)
+	if err != nil {
+		return nil, err
+	}
+	latestVersion := *job.Version
+
 	stubs, _, err := client.Jobs().Allocations(jobName, true, nil)
 	if err != nil {
 		return nil, err
@@ -102,8 +109,9 @@ func loadAllocs(client *api.Client, jobName, group string) (AllocCache, error) {
 		if group != "" && stub.TaskGroup != group {
 			continue
 		}
-		if stub.ClientStatus == "complete" && stub.JobVersion < stub.DesiredVersion {
-			continue // 旧版本
+		// 跳过旧版本的 complete
+		if stub.ClientStatus == "complete" && stub.JobVersion < latestVersion {
+			continue
 		}
 
 		full, _, err := client.Allocations().Info(stub.ID, nil)
@@ -116,7 +124,7 @@ func loadAllocs(client *api.Client, jobName, group string) (AllocCache, error) {
 	return cache, nil
 }
 
-// 检查状态：sidecar 用 Healthy，普通任务用 Complete 或 Healthy
+// 检查状态
 func checkStatus(
 	cache AllocCache,
 	group string,
@@ -141,9 +149,15 @@ func checkStatus(
 			continue
 		}
 
-		// 遍历任务，判断是否 sidecar
+		// 获取任务组定义
+		tg, _, err := api.NewClient(api.DefaultConfig()).JobTaskGroups().Info(a.JobID, a.TaskGroup, nil)
+		if err != nil {
+			ind.WriteString("?")
+			continue
+		}
+
 		isSidecarTask := false
-		for _, task := range a.TaskGroupTasks() {
+		for _, task := range tg.Tasks {
 			if isSidecar(task) {
 				isSidecarTask = true
 				break
@@ -152,12 +166,10 @@ func checkStatus(
 
 		ok := false
 		if isSidecarTask {
-			// sidecar 必须 Healthy
 			if isHealthy(a.Allocation) {
 				ok = true
 			}
 		} else {
-			// 普通任务：batch 用 complete，service 用 healthy
 			if jobType == "batch" {
 				if isComplete(a.Allocation) {
 					ok = true
@@ -296,7 +308,6 @@ func main() {
 				log.Println("Event stream lost, polling")
 			}
 			if events != nil && len(events.Events) > 0 {
-				// 任意事件触发刷新
 				continue
 			}
 		}
