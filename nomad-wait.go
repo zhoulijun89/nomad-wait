@@ -186,7 +186,7 @@ func checkStatus(cache AllocCache, targetGroup, jobType, mode string, expectedCo
 	}
 
 	// 检查活跃分配数量是否符合预期
-	if expectedCount > 0 && activeCount < expectedCount {
+	if mode == "all" && expectedCount > 0 && activeCount < expectedCount {
 		log.Printf("[DEBUG] 活跃分配数量 %d 小于预期 %d，等待更多分配", activeCount, expectedCount)
 		return false, false, strings.Repeat("-", activeCount)
 	}
@@ -236,71 +236,6 @@ func checkStatus(cache AllocCache, targetGroup, jobType, mode string, expectedCo
 	return successful, failed, indicator
 }
 
-// checkStatus 检查缓存中的分配是否达到目标状态
-/*func checkStatus(cache AllocCache, targetGroup, jobType string, expectedCount int) (bool, bool, string) {
-	var indicator string
-	successful := true
-	failed := false
-	activeCount := 0
-
-	// 统计活跃分配
-	for _, a := range cache {
-		if targetGroup != "" && a.TaskGroup != targetGroup {
-			continue
-		}
-		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
-			continue // 忽略非批处理作业的终止分配
-		}
-		activeCount++
-	}
-
-	// 检查活跃分配数量是否符合预期
-	if expectedCount > 0 && activeCount < expectedCount {
-		log.Printf("[DEBUG] 活跃分配数量 %d 小于预期 %d，等待更多分配", activeCount, expectedCount)
-		return false, false, strings.Repeat("-", activeCount)
-	}
-
-	// 检查状态
-	for _, a := range cache {
-		if targetGroup != "" && a.TaskGroup != targetGroup {
-			continue
-		}
-		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
-			continue // 忽略非批处理作业的终止分配
-		}
-
-		status := allocationStatus(a)
-		log.Printf("[DEBUG] 检查分配 %s (TaskGroup: %s, Index: %d): 状态 %s", a.ID, a.TaskGroup, a.Index, status)
-
-		// 动态确定目标状态
-		acceptableStatus := STATUS_HEALTHY
-		if jobType == "batch" {
-			acceptableStatus = STATUS_COMPLETE
-		}
-
-		if status == STATUS_FAILED {
-			failed = true
-			indicator += "!"
-			successful = false
-			continue
-		}
-
-		if status == acceptableStatus {
-			indicator += "+"
-			continue
-		}
-
-		indicator += "-"
-		successful = false
-	}
-
-	// 如果有至少 1 个符合目标状态，且数量满足预期，认为是成功
-	if strings.Contains(indicator, "+") && activeCount <= expectedCount {
-		successful = true
-	}
-
-	return successful, failed, indicator
-}*/
 
 // updateCacheFromEvent 从事件更新分配缓存
 func updateCacheFromEvent(cache AllocCache, ev *api.Event, jobName, targetGroup, jobType string) bool {
