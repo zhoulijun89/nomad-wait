@@ -24,6 +24,7 @@ const (
 	STATUS_COMPLETE  = "complete"  // 批处理作业完成状态
 	STATUS_FAILED    = "failed"    // 失败状态
 	STATUS_RUNNING   = "running"   // 运行中状态
+	STATUS_LOST      = "lost"      // 丢失状态（分配已丢失，需要重新调度）
 )
 
 // Allocation 结构体，扩展 Nomad 的 AllocationListStub，增加索引字段
@@ -124,7 +125,7 @@ func monitoredAllocations(client *api.Client, jobName, group string, jobType str
 				continue
 			}
 			// 忽略已终止的分配（非批处理作业）
-			if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
+			if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED || a.ClientStatus == STATUS_LOST) {
 				continue
 			}
 
@@ -179,7 +180,7 @@ func checkStatus(cache AllocCache, targetGroup, jobType, mode string, expectedCo
 		if targetGroup != "" && a.TaskGroup != targetGroup {
 			continue
 		}
-		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
+		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED || a.ClientStatus == STATUS_LOST) {
 			continue
 		}
 		activeCount++
@@ -196,7 +197,7 @@ func checkStatus(cache AllocCache, targetGroup, jobType, mode string, expectedCo
 		if targetGroup != "" && a.TaskGroup != targetGroup {
 			continue
 		}
-		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED) {
+		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED || a.ClientStatus == STATUS_LOST) {
 			continue
 		}
 
@@ -208,7 +209,7 @@ func checkStatus(cache AllocCache, targetGroup, jobType, mode string, expectedCo
 			acceptableStatus = STATUS_COMPLETE
 		}
 
-		if status == STATUS_FAILED {
+		if status == STATUS_FAILED || status == STATUS_LOST {
 			failed = true
 			indicator += "!"
 			continue
@@ -236,7 +237,6 @@ func checkStatus(cache AllocCache, targetGroup, jobType, mode string, expectedCo
 	return successful, failed, indicator
 }
 
-
 // updateCacheFromEvent 从事件更新分配缓存
 func updateCacheFromEvent(cache AllocCache, ev *api.Event, jobName, targetGroup, jobType string) bool {
 	if ev.Topic != api.TopicAllocation {
@@ -259,7 +259,7 @@ func updateCacheFromEvent(cache AllocCache, ev *api.Event, jobName, targetGroup,
 	}
 
 	// 如果不是批处理作业，移除终止的分配
-	if jobType != "batch" && (alloc.ClientStatus == STATUS_COMPLETE || alloc.ClientStatus == STATUS_FAILED) {
+	if jobType != "batch" && (alloc.ClientStatus == STATUS_COMPLETE || alloc.ClientStatus == STATUS_FAILED || alloc.ClientStatus == STATUS_LOST) {
 		delete(cache, alloc.ID)
 		log.Printf("[DEBUG] 移除终止分配: ID=%s, TaskGroup=%s, 状态=%s", alloc.ID, alloc.TaskGroup, alloc.ClientStatus)
 		return true
@@ -567,5 +567,6 @@ Nomad ACL 认证令牌。
 
 // main 入口函数，调用 Run 并设置退出码
 func main() {
+	log.SetOutput(os.Stdout)
 	os.Exit(Run())
 }
