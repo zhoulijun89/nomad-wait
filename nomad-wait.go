@@ -337,7 +337,7 @@ Nomad ACL 认证令牌。
 	flag.IntVar(&timeout, "t", 0, strings.TrimSpace(timeoutHelpText))
 	flag.StringVar(&group, "group", stringFromEnv("NOMAD_TASK_GROUP", ""), strings.TrimSpace(groupHelpText))
 	flag.StringVar(&token, "token", stringFromEnv("NOMAD_TOKEN", ""), strings.TrimSpace(tokenHelpText))
-	flag.StringVar(&waitMode, "m", "any", "等待模式: 'all' 或 'any'")
+	flag.StringVar(&waitMode, "mode", "any", "等待模式: 'all' 或 'any'")
 	flag.Parse()
 
 	// 覆盖环境变量到 timeout
@@ -347,7 +347,7 @@ Nomad ACL 认证令牌。
 		log.Printf("[ERROR] %v", err)
 		return 1
 	}
-
+    log.Printf("[ERROR] mode:[%s]", waitMode)
 	// 解析作业名称
 	jobName, err := jobNameFromArgs(flag.Args())
 	if err != nil {
