@@ -188,7 +188,7 @@ func checkStatus(cache AllocCache, targetGroup, jobType, mode string, expectedCo
 
 	// 检查活跃分配数量是否符合预期
 	if mode == "all" && expectedCount > 0 && activeCount < expectedCount {
-		log.Printf("[DEBUG] 活跃分配数量 %d 小于预期 %d，等待更多分配", activeCount, expectedCount)
+		log.Printf("[DEBUG] %s模式 活跃分配数量 %d 小于预期 %d，等待更多分配",mode,activeCount, expectedCount)
 		return false, false, strings.Repeat("-", activeCount)
 	}
 
