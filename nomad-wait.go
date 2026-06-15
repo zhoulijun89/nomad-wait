@@ -188,7 +188,7 @@ func checkStatus(cache AllocCache, targetGroup, jobType, mode string, expectedCo
 
 	// 检查活跃分配数量是否符合预期
 	if mode == "all" && expectedCount > 0 && activeCount < expectedCount {
-		log.Printf("[DEBUG] %s模式 活跃分配数量 %d 小于预期 %d，等待更多分配",mode,activeCount, expectedCount)
+		log.Printf("[DEBUG] %s模式 活跃分配数量 %d 小于预期 %d，等待更多分配", mode, activeCount, expectedCount)
 		return false, false, strings.Repeat("-", activeCount)
 	}
 
@@ -317,7 +317,7 @@ Nomad 服务器地址。
 	timeoutHelpText := `
 等待超时时间（秒，0 表示永不超时）。
 如果设置了 NOMAD_JOB_TIMEOUT 环境变量，将被覆盖。
-默认值 = 0（无限等待）
+默认值 = 60（无限等待）
 	`
 	groupHelpText := `
 要等待健康状态的特定任务组（可选）。
@@ -333,8 +333,8 @@ Nomad ACL 认证令牌。
 
 	// 定义命令行标志
 	flag.StringVar(&nomadConfig.Address, "address", stringFromEnv("NOMAD_ADDR", "http://127.0.0.1:4646"), strings.TrimSpace(addressHelpText))
-	flag.IntVar(&timeout, "timeout", 0, strings.TrimSpace(timeoutHelpText)) // 默认永不超时
-	flag.IntVar(&timeout, "t", 0, strings.TrimSpace(timeoutHelpText))
+	flag.IntVar(&timeout, "timeout", 60, strings.TrimSpace(timeoutHelpText)) // 默认永不超时
+	flag.IntVar(&timeout, "t", 60, strings.TrimSpace(timeoutHelpText))
 	flag.StringVar(&group, "group", stringFromEnv("NOMAD_TASK_GROUP", ""), strings.TrimSpace(groupHelpText))
 	flag.StringVar(&token, "token", stringFromEnv("NOMAD_TOKEN", ""), strings.TrimSpace(tokenHelpText))
 	flag.StringVar(&waitMode, "mode", "any", "等待模式: 'all' 或 'any'")
@@ -347,7 +347,7 @@ Nomad ACL 认证令牌。
 		log.Printf("[ERROR] %v", err)
 		return 1
 	}
-    log.Printf("[ERROR] mode:[%s]", waitMode)
+	log.Printf("[ERROR] mode:[%s]", waitMode)
 	// 解析作业名称
 	jobName, err := jobNameFromArgs(flag.Args())
 	if err != nil {
