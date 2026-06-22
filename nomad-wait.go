@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -36,14 +37,85 @@ type Allocation struct {
 // AllocCache 用于缓存分配状态，便于事件更新和检查
 type AllocCache map[string]*Allocation
 
-// findAllocation 在分配列表中查找特定任务组和索引的分配
-func findAllocation(allocs []*Allocation, taskGroup string, index int) *Allocation {
-	for _, alloc := range allocs {
-		if alloc.TaskGroup == taskGroup && alloc.Index == index {
-			return alloc
+// allocationIsNewer 判断 candidate 是否比 current 更新。
+// Nomad 重调度时，同一个 TaskGroup + Index 会产生新的 Allocation ID。
+func allocationIsNewer(candidate, current *Allocation) bool {
+	if candidate.CreateTime != current.CreateTime {
+		return candidate.CreateTime > current.CreateTime
+	}
+	if candidate.CreateIndex != current.CreateIndex {
+		return candidate.CreateIndex > current.CreateIndex
+	}
+	if candidate.ModifyIndex != current.ModifyIndex {
+		return candidate.ModifyIndex > current.ModifyIndex
+	}
+	return candidate.ID > current.ID
+}
+
+// upsertLatestAllocation 在分配列表中按 TaskGroup + Index 只保留最新记录
+func upsertLatestAllocation(allocs []*Allocation, candidate *Allocation) []*Allocation {
+	for i, alloc := range allocs {
+		if alloc.TaskGroup == candidate.TaskGroup && alloc.Index == candidate.Index {
+			if allocationIsNewer(candidate, alloc) {
+				allocs[i] = candidate
+			}
+			return allocs
 		}
 	}
-	return nil
+	return append(allocs, candidate)
+}
+
+// latestAllocations 从缓存中按 TaskGroup + Index 归并，并返回稳定顺序的最新记录
+func latestAllocations(cache AllocCache, targetGroup string) []*Allocation {
+	latest := make(map[string]*Allocation)
+	for _, alloc := range cache {
+		if targetGroup != "" && alloc.TaskGroup != targetGroup {
+			continue
+		}
+		key := fmt.Sprintf("%s\x00%d", alloc.TaskGroup, alloc.Index)
+		if current, ok := latest[key]; !ok || allocationIsNewer(alloc, current) {
+			latest[key] = alloc
+		}
+	}
+
+	result := make([]*Allocation, 0, len(latest))
+	for _, alloc := range latest {
+		result = append(result, alloc)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].TaskGroup != result[j].TaskGroup {
+			return result[i].TaskGroup < result[j].TaskGroup
+		}
+		return result[i].Index < result[j].Index
+	})
+	return result
+}
+
+// upsertAllocationCache 更新缓存，并淘汰同一个 TaskGroup + Index 的旧 Allocation
+func upsertAllocationCache(cache AllocCache, candidate *Allocation) bool {
+	var currentLatest *Allocation
+	for _, current := range cache {
+		if current.TaskGroup != candidate.TaskGroup || current.Index != candidate.Index {
+			continue
+		}
+		if currentLatest == nil || allocationIsNewer(current, currentLatest) {
+			currentLatest = current
+		}
+	}
+	if currentLatest != nil && currentLatest.ID != candidate.ID && !allocationIsNewer(candidate, currentLatest) {
+		return false
+	}
+	if currentLatest != nil && currentLatest.ID == candidate.ID && allocationIsNewer(currentLatest, candidate) {
+		return false
+	}
+
+	for id, current := range cache {
+		if current.TaskGroup == candidate.TaskGroup && current.Index == candidate.Index {
+			delete(cache, id)
+		}
+	}
+	cache[candidate.ID] = candidate
+	return true
 }
 
 // stringFromEnv 从环境变量读取字符串值，若未设置或为空则返回默认值
@@ -134,13 +206,7 @@ func monitoredAllocations(client *api.Client, jobName, group string, jobType str
 				return nil, err
 			}
 
-			if alloc := findAllocation(result, a.TaskGroup, index); alloc != nil {
-				if alloc.CreateTime < a.CreateTime {
-					alloc = &Allocation{*a, index}
-				}
-			} else {
-				result = append(result, &Allocation{*a, index})
-			}
+			result = upsertLatestAllocation(result, &Allocation{*a, index})
 		}
 
 		if meta.NextToken == "" {
@@ -174,12 +240,10 @@ func checkStatus(cache AllocCache, targetGroup, jobType, mode string, expectedCo
 	healthyCount := 0
 
 	mode = strings.ToLower(mode)
+	allocs := latestAllocations(cache, targetGroup)
 
 	// 统计活跃分配
-	for _, a := range cache {
-		if targetGroup != "" && a.TaskGroup != targetGroup {
-			continue
-		}
+	for _, a := range allocs {
 		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED || a.ClientStatus == STATUS_LOST) {
 			continue
 		}
@@ -193,10 +257,7 @@ func checkStatus(cache AllocCache, targetGroup, jobType, mode string, expectedCo
 	}
 
 	// 检查每个分配状态
-	for _, a := range cache {
-		if targetGroup != "" && a.TaskGroup != targetGroup {
-			continue
-		}
+	for _, a := range allocs {
 		if jobType != "batch" && (a.ClientStatus == STATUS_COMPLETE || a.ClientStatus == STATUS_FAILED || a.ClientStatus == STATUS_LOST) {
 			continue
 		}
@@ -268,19 +329,28 @@ func updateCacheFromEvent(cache AllocCache, ev *api.Event, jobName, targetGroup,
 	// 更新或添加缓存
 	newAlloc := &Allocation{AllocationListStub: api.AllocationListStub{
 		ID:               alloc.ID,
+		Name:             alloc.Name,
 		JobID:            alloc.JobID,
 		TaskGroup:        alloc.TaskGroup,
 		ClientStatus:     alloc.ClientStatus,
 		DeploymentStatus: alloc.DeploymentStatus,
+		CreateIndex:      alloc.CreateIndex,
+		ModifyIndex:      alloc.ModifyIndex,
 		CreateTime:       alloc.CreateTime,
+		ModifyTime:       alloc.ModifyTime,
 	}}
 	_, _, index, err := parseAllocationName(alloc.Name)
-	if err == nil {
-		newAlloc.Index = index
+	if err != nil {
+		log.Printf("[ERROR] 无法解析事件中的分配名称 %q: %v", alloc.Name, err)
+		return false
 	}
-	cache[alloc.ID] = newAlloc
+	newAlloc.Index = index
+	if !upsertAllocationCache(cache, newAlloc) {
+		log.Printf("[DEBUG] 忽略同槽位的旧分配事件: ID=%s, TaskGroup=%s, Index=%d", alloc.ID, alloc.TaskGroup, index)
+		return false
+	}
 
-	log.Printf("[DEBUG] 更新分配缓存: ID=%s, TaskGroup=%s, 新状态=%s", alloc.ID, alloc.TaskGroup, alloc.ClientStatus)
+	log.Printf("[DEBUG] 更新分配缓存: ID=%s, TaskGroup=%s, Index=%d, 新状态=%s", alloc.ID, alloc.TaskGroup, index, alloc.ClientStatus)
 	return true
 }
 

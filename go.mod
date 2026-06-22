@@ -1,12 +1,15 @@
 module github.com/zhoulijun89/nomad-wait
 
-go 1.25.1 
+go 1.25.1
 
 require (
-    github.com/hashicorp/nomad/api v0.0.0-20251003131842-48863bda8a9b
 	github.com/alexflint/go-restructure v0.2.0
-	github.com/gorilla/websocket v1.5.0 // indirect
-	github.com/hashicorp/cronexpr v1.1.2 // indirect
+	github.com/hashicorp/nomad/api v0.0.0-20251003131842-48863bda8a9b
+)
+
+require (
+	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/hashicorp/cronexpr v1.1.3 // indirect
 	github.com/hashicorp/errwrap v1.0.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
