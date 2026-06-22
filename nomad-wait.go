@@ -372,52 +372,59 @@ func setupLogger() {
 func Run() int {
 	setupLogger() // 初始化日志
 
-	var timeout int
+	timeout, err := intFromEnv("NOMAD_JOB_TIMEOUT", 60)
+	if err != nil {
+		log.Printf("[ERROR] %v", err)
+		return 1
+	}
 	var group string
 	var token string
-	var err error
 	var waitMode string
 
 	// 定义命令行标志的帮助文本
 	addressHelpText := `
 Nomad 服务器地址。
-如果设置了 NOMAD_ADDR 环境变量，将被覆盖。
-默认值 = http://127.0.0.1:4646 
+命令行参数会覆盖 NOMAD_ADDR 环境变量。
+默认值：http://127.0.0.1:4646
 	`
 	timeoutHelpText := `
 等待超时时间（秒，0 表示永不超时）。
-如果设置了 NOMAD_JOB_TIMEOUT 环境变量，将被覆盖。
-默认值 = 60（无限等待）
+命令行参数会覆盖 NOMAD_JOB_TIMEOUT 环境变量。
+默认值：60
 	`
 	groupHelpText := `
 要等待健康状态的特定任务组（可选）。
 如果未设置，等待作业中所有任务组。
-如果设置了 NOMAD_TASK_GROUP 环境变量，将被覆盖。
+命令行参数会覆盖 NOMAD_TASK_GROUP 环境变量。
 	`
 	tokenHelpText := `
 Nomad ACL 认证令牌。
-如果设置了 NOMAD_TOKEN 环境变量，将被覆盖。
+命令行参数会覆盖 NOMAD_TOKEN 环境变量。
+	`
+	modeHelpText := `
+等待模式：
+  any：任意一个分配健康或完成即成功。
+  all：所有预期分配均健康或完成才成功。
+默认值：any
 	`
 
 	nomadConfig := api.DefaultConfig()
 
 	// 定义命令行标志
 	flag.StringVar(&nomadConfig.Address, "address", stringFromEnv("NOMAD_ADDR", "http://127.0.0.1:4646"), strings.TrimSpace(addressHelpText))
-	flag.IntVar(&timeout, "timeout", 60, strings.TrimSpace(timeoutHelpText)) // 默认永不超时
-	flag.IntVar(&timeout, "t", 60, strings.TrimSpace(timeoutHelpText))
+	flag.IntVar(&timeout, "timeout", timeout, strings.TrimSpace(timeoutHelpText))
+	flag.IntVar(&timeout, "t", timeout, strings.TrimSpace(timeoutHelpText))
 	flag.StringVar(&group, "group", stringFromEnv("NOMAD_TASK_GROUP", ""), strings.TrimSpace(groupHelpText))
 	flag.StringVar(&token, "token", stringFromEnv("NOMAD_TOKEN", ""), strings.TrimSpace(tokenHelpText))
-	flag.StringVar(&waitMode, "mode", "any", "等待模式: 'all' 或 'any'")
+	flag.StringVar(&waitMode, "mode", "any", strings.TrimSpace(modeHelpText))
 	flag.Parse()
 
-	// 覆盖环境变量到 timeout
-	if envTimeout, err := intFromEnv("NOMAD_JOB_TIMEOUT", timeout); err == nil {
-		timeout = envTimeout
-	} else {
-		log.Printf("[ERROR] %v", err)
+	waitMode = strings.ToLower(strings.TrimSpace(waitMode))
+	if waitMode != "any" && waitMode != "all" {
+		log.Printf("[ERROR] 无效的等待模式 %q，只支持 any 或 all", waitMode)
 		return 1
 	}
-	log.Printf("[ERROR] mode:[%s]", waitMode)
+	log.Printf("[INFO] 等待模式: %s", waitMode)
 	// 解析作业名称
 	jobName, err := jobNameFromArgs(flag.Args())
 	if err != nil {
