@@ -18,8 +18,15 @@ nomad-wait [参数] <作业名称>
 nomad-wait -address http://127.0.0.1:4646 -group mysql -mode all -timeout 120 example-job
 ```
 
+查看构建信息：
+
+```shell
+nomad-wait -v
+```
+
 ## 参数
 
+- `-v`：打印编译时间和 Git commit hash 后退出。
 - `-address`：Nomad 服务地址。默认读取 `NOMAD_ADDR`，未设置时使用 `http://127.0.0.1:4646`。
 - `-t`、`-timeout`：等待超时时间，单位为秒。`0` 表示永不超时，默认读取 `NOMAD_JOB_TIMEOUT`，未设置时为 `60`。
 - `-group`：只等待指定 Task Group。默认读取 `NOMAD_TASK_GROUP`；未设置时检查 Job 的所有 Task Group。

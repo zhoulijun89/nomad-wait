@@ -28,6 +28,16 @@ const (
 	STATUS_LOST      = "lost"      // 丢失状态（分配已丢失，需要重新调度）
 )
 
+// buildTime 和 commitHash 在构建时通过 -ldflags 注入。
+var (
+	buildTime  = "unknown"
+	commitHash = "unknown"
+)
+
+func printVersion() {
+	fmt.Printf("Build time: %s\nCommit hash: %s\n", buildTime, commitHash)
+}
+
 // Allocation 结构体，扩展 Nomad 的 AllocationListStub，增加索引字段
 type Allocation struct {
 	api.AllocationListStub
@@ -370,8 +380,6 @@ func setupLogger() {
 
 // Run 主逻辑函数，执行等待作业或任务组健康状态的逻辑（优先事件流，回退轮询）
 func Run() int {
-	setupLogger() // 初始化日志
-
 	timeout, err := intFromEnv("NOMAD_JOB_TIMEOUT", 60)
 	if err != nil {
 		log.Printf("[ERROR] %v", err)
@@ -380,6 +388,7 @@ func Run() int {
 	var group string
 	var token string
 	var waitMode string
+	var showVersion bool
 
 	// 定义命令行标志的帮助文本
 	addressHelpText := `
@@ -417,7 +426,15 @@ Nomad ACL 认证令牌。
 	flag.StringVar(&group, "group", stringFromEnv("NOMAD_TASK_GROUP", ""), strings.TrimSpace(groupHelpText))
 	flag.StringVar(&token, "token", stringFromEnv("NOMAD_TOKEN", ""), strings.TrimSpace(tokenHelpText))
 	flag.StringVar(&waitMode, "mode", "any", strings.TrimSpace(modeHelpText))
+	flag.BoolVar(&showVersion, "v", false, "打印编译时间和 commit hash")
 	flag.Parse()
+
+	if showVersion {
+		printVersion()
+		return 0
+	}
+
+	setupLogger() // 初始化日志
 
 	waitMode = strings.ToLower(strings.TrimSpace(waitMode))
 	if waitMode != "any" && waitMode != "all" {
